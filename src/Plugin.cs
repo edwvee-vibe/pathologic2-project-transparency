@@ -21,7 +21,7 @@ namespace Pathologic2ProjectTransparency
     // Other opaque shaders (Standard, skin, SpeedTree, ...) are swapped to Universal Dithered as a best effort
     // (Scope = AllOpaque): textures with the usual names (_MainTex, _BumpMap, ...) carry over, the rest is lost.
     //
-    // Mode = Fade is the alternative: real alpha blending with "Pathologic/Universal Fade" / "Universal Metallic Fade"
+    // Mode = Fade / FadeOld is the alternative: real alpha blending with "Pathologic/Universal Fade" / "Universal Metallic Fade"
     // (same properties again; Blend SrcAlpha OneMinusSrcAlpha, ZWrite Off, queue Transparent, passes ForwardBase + ForwardAdd).
     // Every converted object is then drawn in the forward path, once more per extra light, sorted per object (large meshes
     // can sort wrong), without writing depth (no motion vectors for DLSS/TAA, no deferred fog/AO on it) and without a
@@ -35,7 +35,7 @@ namespace Pathologic2ProjectTransparency
     {
         public const string Guid = "pathologic2.projecttransparency";
         public const string Name = "Pathologic 2 Project Transparency";
-        public const string Version = "1.0.0";
+        public const string Version = "1.1.0";
 
         private const string DitheredName = "Pathologic/Universal Dithered";
         private const string MetallicDitheredName = "Pathologic/Universal Metallic Dithered";
@@ -64,6 +64,12 @@ namespace Pathologic2ProjectTransparency
             public int Queue; // raw custom render queue, -1 = from the shader
             public Shader Target;
             public float AppliedAlpha;
+            // Best-effort conversions: specular values the mod filled in, and the originals to put back.
+            public bool SpecTouched;
+            public bool HadSpecColor;
+            public Color SpecColor;
+            public bool HadSpecMap;
+            public Texture SpecMap;
         }
 
         // Key: material instance id.
@@ -78,10 +84,29 @@ namespace Pathologic2ProjectTransparency
         private Shader dithered;
         private Shader metallicDithered;
         private Shader fade;
+        private Texture2D dullSpecular;
+
+        // Inner parts of heads (eyeballs, teeth, mouth interior, eye gloss layers). In Fade nothing writes depth, so they either
+        // show over the face (drawn after it) or vanish under the back of the head and the hair (drawn before them).
+        // Mode = Fade draws the opaque ones (eyeballs, teeth, mouth) dithered instead: they write depth, so the back of the head
+        // cannot paint over them, and the see-through face and eyelids in front are blended over them. The game's own
+        // transparent eye gloss layers are drawn before the rest of the transparent queue, so the face covers them.
+        private static readonly System.Text.RegularExpressions.Regex InnerPart = new System.Text.RegularExpressions.Regex(
+            "eye|mouth|teeth|tooth|tongue", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        private static readonly System.Text.RegularExpressions.Regex NotInnerPart = new System.Text.RegularExpressions.Regex(
+            "lash|brow", System.Text.RegularExpressions.RegexOptions.IgnoreCase);
+        private const int InnerLayerQueue = 2991; // the game's own transparent eye layers, before the faces
+
+        private static bool IsInnerPart(Material m)
+        {
+            return InnerPart.IsMatch(m.name) && !NotInnerPart.IsMatch(m.name);
+        }
         private Shader metallicFade;
         private bool warnedNoFade;
         private float nextScan;
         private bool applied;
+        private TaaSmoothing taa;
+        private readonly FadeSorting fadeSorting = new FadeSorting();
 
         private static string osdText;
         private static float osdUntil;
@@ -101,9 +126,14 @@ namespace Pathologic2ProjectTransparency
             enabledCfg = Config.Bind("General", "Enabled", true,
                 "true: the world is drawn semi-transparent. false: vanilla.");
             modeCfg = Config.Bind("General", "Mode", Mode.Fade,
-                "Dither: screen-door transparency in the deferred pass (shadows, fog, DLSS keep working; fine grain).\n" +
-                "Fade: real alpha blending in the forward pass (smooth, true layering; no shadows from converted " +
-                "objects, sorting errors on large meshes, may ghost with DLSS/TAA).");
+                "Fade: real alpha blending in the forward pass (smooth, true layering; no shadows from converted objects, " +
+                "may ghost with DLSS/TAA), with a better drawing order, dithered eyeballs, teeth and mouths, and trees, " +
+                "bushes and skin of other shaders keeping their color instead of turning white.\n" +
+                "FadeOld: the Fade mode of 1.0.0 (Unity's sorting, white trees, eyes showing through faces).\n" +
+                "Dither: screen-door transparency in the deferred pass (shadows, fog, DLSS keep working; fine grain), " +
+                "with the game's TAA averaging more frames to blur the grain (only with the game's TAA, not DLSS) and " +
+                "trees, bushes and skin keeping their color.\n" +
+                "DitherOld: the Dither mode of 1.0.0 (no TAA change, white trees).");
             alphaCfg = Config.Bind("General", "Alpha", 0.5f, new ConfigDescription(
                 "Opacity of every surface: 1 = opaque, 0.5 = half of the pixels drawn, 0 = invisible. " +
                 "Materials that were already dithered (soft hair edges) get their own opacity multiplied by this value.",
@@ -124,8 +154,10 @@ namespace Pathologic2ProjectTransparency
                 "The log lists every shader the mod converted as a best effort (Scope = AllOpaque).");
             toggleKeyCfg = Config.Bind("General", "ToggleKey", new KeyboardShortcut(KeyCode.PageUp), "Key to toggle the mod in game.");
             modeKeyCfg = Config.Bind("General", "ModeKey", new KeyboardShortcut(KeyCode.PageDown),
-                "Key to switch between Dither and Fade (also turns the mod on).");
+                "Key to cycle the modes Fade -> FadeOld -> Dither -> DitherOld (also turns the mod on).");
             showMessagesCfg = Config.Bind("General", "ShowMessages", true, "Show an on-screen message when toggling.");
+
+            taa = new TaaSmoothing(Config);
 
             enabledCfg.SettingChanged += (s, e) =>
             {
@@ -162,7 +194,7 @@ namespace Pathologic2ProjectTransparency
             }
             else if (IsPressed(modeKeyCfg.Value))
             {
-                modeCfg.Value = modeCfg.Value == Mode.Dither ? Mode.Fade : Mode.Dither; // SettingChanged restores, the scan reapplies
+                modeCfg.Value = NextMode(modeCfg.Value); // SettingChanged restores, the scan reapplies
                 enabledCfg.Value = true;
                 string text = StateText();
                 Log.LogInfo(text);
@@ -174,12 +206,36 @@ namespace Pathologic2ProjectTransparency
                 nextScan = Time.unscaledTime + rescanCfg.Value;
                 try
                 {
+                    if (modeCfg.Value == Mode.Dither)
+                    {
+                        taa.Apply();
+                    }
+                    else
+                    {
+                        taa.Restore();
+                    }
                     Scan();
                 }
                 catch (Exception e)
                 {
                     Log.LogError("Scan failed: " + e);
                 }
+            }
+        }
+
+        private bool IsFade => modeCfg.Value == Mode.FadeOld || modeCfg.Value == Mode.Fade;
+
+        // The two newer modes; DitherOld and FadeOld are the Dither and Fade of 1.0.0, unchanged.
+        private bool IsImproved => modeCfg.Value == Mode.Dither || modeCfg.Value == Mode.Fade;
+
+        private static Mode NextMode(Mode mode)
+        {
+            switch (mode)
+            {
+                case Mode.Fade: return Mode.FadeOld;
+                case Mode.FadeOld: return Mode.Dither;
+                case Mode.Dither: return Mode.DitherOld;
+                default: return Mode.Fade;
             }
         }
 
@@ -209,7 +265,7 @@ namespace Pathologic2ProjectTransparency
             {
                 metallicDithered = FindShader(MetallicDitheredName);
             }
-            if (modeCfg.Value == Mode.Fade)
+            if (IsFade)
             {
                 if (fade == null)
                 {
@@ -293,8 +349,24 @@ namespace Pathologic2ProjectTransparency
                     continue;
                 }
 
+                bool innerDither = modeCfg.Value == Mode.Fade && IsInnerPart(m) && m.renderQueue < 2500;
                 bool wasDithered, bestEffort;
-                Shader target = PickTarget(m, shader, out wasDithered, out bestEffort);
+                Shader target = PickTarget(m, shader, innerDither, out wasDithered, out bestEffort);
+                if (target == null && modeCfg.Value == Mode.Fade && IsInnerPart(m) && m.renderQueue >= 2500 && m.renderQueue < 3500)
+                {
+                    saved[id] = new Saved
+                    {
+                        Mat = m,
+                        Shader = shader,
+                        Keywords = m.shaderKeywords,
+                        HasColor = false,
+                        Queue = m.renderQueue == shader.renderQueue ? -1 : m.renderQueue,
+                        Target = shader,
+                    };
+                    m.renderQueue = InnerLayerQueue;
+                    converted++;
+                    continue;
+                }
                 if (target == null)
                 {
                     skipped.Add(id);
@@ -323,12 +395,30 @@ namespace Pathologic2ProjectTransparency
                     s.Color = m.GetColor("_Color");
                 }
 
+                if (bestEffort && IsImproved)
+                {
+                    // Remember the specular values before the swap: the original shader may use them too.
+                    s.HadSpecColor = m.HasProperty("_SpecColor");
+                    if (s.HadSpecColor)
+                    {
+                        s.SpecColor = m.GetColor("_SpecColor");
+                    }
+                    s.HadSpecMap = m.HasProperty("_SpecGlossMap");
+                    if (s.HadSpecMap)
+                    {
+                        s.SpecMap = m.GetTexture("_SpecGlossMap");
+                    }
+                }
                 if (target != shader)
                 {
                     m.shader = target;
                     m.shaderKeywords = s.Keywords;
                 }
-                if (modeCfg.Value == Mode.Fade)
+                if (bestEffort && IsImproved)
+                {
+                    FixSpecular(m, s);
+                }
+                if (IsFade && !innerDither)
                 {
                     m.renderQueue = -1; // the Transparent queue of the Fade shader: after the opaque world and the sky
                 }
@@ -348,11 +438,58 @@ namespace Pathologic2ProjectTransparency
                 converted++;
             }
 
+            if (modeCfg.Value == Mode.Fade)
+            {
+                int found = fadeSorting.Discover(materialId => saved.ContainsKey(materialId));
+                if (found > 0)
+                {
+                    Log.LogInfo($"Fade: {found} new see-through renderers to sort (total {fadeSorting.Count})");
+                }
+                Camera cam = Camera.main;
+                if (cam == null)
+                {
+                    foreach (Camera c in Camera.allCameras)
+                    {
+                        if (cam == null || c.depth > cam.depth)
+                        {
+                            cam = c;
+                        }
+                    }
+                }
+                fadeSorting.Update(cam);
+            }
+
             if (converted > 0)
             {
                 applied = true;
                 Log.LogInfo($"Made {converted} materials see-through (total {saved.Count}, left as is {skipped.Count})");
             }
+        }
+
+        // The Universal shaders default to a white specular color and a white specular map (full mirror reflection, no diffuse
+        // color). Materials of other shaders (trees, bushes, skin) do not set them, so after the swap they turned white.
+        // Give them a dull dielectric specular instead (4% reflectance, low smoothness).
+        private void FixSpecular(Material m, Saved s)
+        {
+            if (!m.HasProperty("_SpecGlossMap"))
+            {
+                return;
+            }
+            if (dullSpecular == null)
+            {
+                dullSpecular = new Texture2D(1, 1, TextureFormat.RGBA32, false, true) { name = "TransparencyDullSpecular" };
+                dullSpecular.SetPixel(0, 0, new Color(0.04f, 0.04f, 0.04f, 0.2f));
+                dullSpecular.Apply();
+            }
+            if (!s.HadSpecColor && m.HasProperty("_SpecColor"))
+            {
+                m.SetColor("_SpecColor", Color.white); // the map alone decides, whether the shader multiplies by the color or not
+            }
+            if (m.GetTexture("_SpecGlossMap") == null || !s.HadSpecMap)
+            {
+                m.SetTexture("_SpecGlossMap", dullSpecular);
+            }
+            s.SpecTouched = true;
         }
 
         // A runtime copy of an already converted material (renderer.material made after the swap) is already see-through;
@@ -384,11 +521,16 @@ namespace Pathologic2ProjectTransparency
                 Queue = source.Queue,
                 Target = source.Target,
                 AppliedAlpha = source.AppliedAlpha,
+                SpecTouched = source.SpecTouched,
+                HadSpecColor = source.HadSpecColor,
+                SpecColor = source.SpecColor,
+                HadSpecMap = source.HadSpecMap,
+                SpecMap = source.SpecMap,
             };
             return true;
         }
 
-        private Shader PickTarget(Material m, Shader shader, out bool wasDithered, out bool bestEffort)
+        private Shader PickTarget(Material m, Shader shader, bool forceDither, out bool wasDithered, out bool bestEffort)
         {
             wasDithered = false;
             bestEffort = false;
@@ -401,7 +543,7 @@ namespace Pathologic2ProjectTransparency
                     return null;
                 }
             }
-            bool isFade = modeCfg.Value == Mode.Fade;
+            bool isFade = IsFade && !forceDither;
             Shader plain = isFade ? fade : dithered;
             Shader metallic = isFade ? (metallicFade != null ? metallicFade : fade)
                                      : (metallicDithered != null ? metallicDithered : dithered);
@@ -447,6 +589,8 @@ namespace Pathologic2ProjectTransparency
 
         private void Restore()
         {
+            taa.Restore();
+            fadeSorting.Restore();
             int restored = 0;
             foreach (Saved s in saved.Values)
             {
@@ -460,6 +604,14 @@ namespace Pathologic2ProjectTransparency
                 }
                 s.Mat.shaderKeywords = s.Keywords;
                 s.Mat.renderQueue = s.Queue;
+                if (s.SpecTouched)
+                {
+                    // Put back the original values. Where the material had no such property, reset it to the shader default
+                    // (white color, no texture): the value stays stored in the material and would leak into DitherOld and FadeOld,
+                    // which must keep the white look of these materials.
+                    s.Mat.SetColor("_SpecColor", s.HadSpecColor ? s.SpecColor : Color.white);
+                    s.Mat.SetTexture("_SpecGlossMap", s.HadSpecMap ? s.SpecMap : null);
+                }
                 if (s.HasColor && s.Mat.HasProperty("_Color"))
                 {
                     s.Mat.SetColor("_Color", s.Color);
@@ -531,8 +683,10 @@ namespace Pathologic2ProjectTransparency
 
     public enum Mode
     {
+        Fade,
+        FadeOld,
         Dither,
-        Fade
+        DitherOld
     }
 
     public enum Scope
